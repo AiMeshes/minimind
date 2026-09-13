@@ -351,7 +351,7 @@ cd trainer && python train_pretrain.py
 
 **⚡ 优化技巧**（全部已在 `train_pretrain.py` 实现，检测到依赖后自动启用）
 
-1. **Sequence Packing**：数据侧在线把多篇文档拼成 `2048` 定长块（`[bos]+tokens+[eos]` 无缝拼接），**零 padding**，每一个 token 都参与训练，GPU 算力利用率拉满；
+1. **Sequence Packing**：数据侧在线把多篇文档按最大长度紧凑装袋成 `2048` 定长块（`[bos]+tokens+[eos]` 整块装入，剩余空间装不下下一篇时就地 pad 封口、另起新块，文档绝不跨块断开，超长文档截断保留 bos/eos）；块尾 padding 的 label 置 `-100` 不参与训练，配合变长 attention 时 pad 段独立隔离，GPU 算力利用率拉满；
 2. **变长 Attention（flash-attn varlen）**：packing 的正确搭档。`flash_attn_varlen_func` 按 `cu_seqlens` 文档边界隔离因果注意力（文档间互不 attend），RoPE 位置每篇文档内重置为 0；文档边界由 packing 块内的 bos 位置自动推导，无需改动数据格式。包装为 `torch.library` custom op，兼容 `torch.compile` 全图编译；
 3. **WSD 学习率调度**（`--lr_scheduler wsd`）：1% 线性 warmup → 稳定期 → 最后 20% cosine 衰减至 `0.1x`，按 step 确定性计算，续训后自动衔接；
 4. **fused AdamW**（`fused=True`）：整个优化器 step 融合为单次 CUDA kernel，优化器状态读写流量从 ~10 趟降到 ~2 趟；

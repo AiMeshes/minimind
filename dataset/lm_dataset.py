@@ -5,7 +5,7 @@ import os
 import glob
 import random
 import re
-from itertools import chain, islice
+from itertools import islice
 from datasets import Dataset as HFDataset, load_dataset, Features, Sequence, Value
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -40,8 +40,9 @@ def post_processing_chat(prompt_content, empty_think_ratio=0.2):
 class PretrainDataset(Dataset):
     """英文语料预训练数据集：支持 parquet 分片目录 / glob / 单个 jsonl，文本列默认为 'text'。
 
-    采用 packing 方式：每条文档编码为 [bos] + tokens + [eos]，随后无缝拼接成
-    max_length 定长块，消除 padding 浪费，显著提升 GPU 利用率。
+    采用按最大长度紧凑 packing：每篇文档编码为 [bos] + tokens + [eos] 后按序整块装袋——
+    当前块剩余空间装不下下一篇时就地封口（块尾 pad 补齐到 max_length，labels 置 -100），
+    新块重新开头，文档绝不跨块断开；单篇超长时截断正文、保留 bos/eos。
     大规模语料（百万级文档）会流式预处理并落盘为 arrow 缓存（int16 内存映射加载），
     重复训练/续训时可直接复用，跳过数小时的分词+packing。
     """
@@ -89,13 +90,17 @@ class PretrainDataset(Dataset):
 def _stream_pack_parquet(files, text_column, max_samples, min_doc_chars, max_length,
                          tokenizer, num_proc, packed_cache):
     """流式预处理 parquet：按 shard 读 text 列 -> 线程池并行分词（Rust 实现释放 GIL）
-    -> 拼接成定长块 -> 逐批写入 arrow IPC 文件。峰值内存约一个 chunk，磁盘仅最终缓存。"""
+    -> 按最大长度紧凑 packing 成定长块 -> 逐批写入 arrow IPC 文件。峰值内存约一个 chunk，磁盘仅最终缓存。
+
+    紧凑 packing：每篇文档 [bos]+tokens+[eos] 整块装入当前块，剩余空间装不下下一篇时就地
+    封口（块尾 pad 补齐到 max_length），文档不跨块；单篇超长截断正文保留 bos/eos。"""
     import pyarrow as pa
     import pyarrow.parquet as pq
     from concurrent.futures import ThreadPoolExecutor
 
     id_dtype = pa.int16() if len(tokenizer) <= 32768 else pa.int32()
     bos_id, eos_id = tokenizer.bos_token_id, tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id
     tok = tokenizer  # fast tokenizer，encode 期间释放 GIL，线程即可打满多核
 
     def read_texts():
@@ -120,34 +125,42 @@ def _stream_pack_parquet(files, text_column, max_samples, min_doc_chars, max_len
     sink = pa.OSFile(packed_cache, 'wb') if packed_cache else pa.BufferOutputStream()
     writer = pa.ipc.new_stream(sink, pa.schema([('input_ids', pa.list_(id_dtype))]))
     buf, n_blocks, n_docs = [], 0, 0
+
+    def write_block(block):
+        nonlocal n_blocks
+        block.extend([pad_id] * (max_length - len(block)))  # 紧凑块封口：块尾 pad 补齐到定长
+        writer.write_batch(pa.record_batch([pa.array([block], type=pa.list_(id_dtype))],
+                                           names=['input_ids']))
+        n_blocks += 1
+
     try:
         with ThreadPoolExecutor(max_workers=num_proc) as pool:
             for texts in chunk_iter(read_texts(), 20000):
                 for ids in pool.map(lambda t: tok(t, add_special_tokens=False)['input_ids'], texts):
-                    buf.append(bos_id)
-                    buf.extend(ids)
-                    buf.append(eos_id)
-                    while len(buf) >= max_length:
-                        writer.write_batch(pa.record_batch([pa.array([buf[:max_length]], type=pa.list_(id_dtype))],
-                                                           names=['input_ids']))
-                        buf = buf[max_length:]
-                        n_blocks += 1
+                    if len(ids) > max_length - 2:  # 单篇超长：截断正文，保留 bos/eos
+                        ids = ids[:max_length - 2]
+                    doc = [bos_id, *ids, eos_id]
+                    if buf and len(buf) + len(doc) > max_length:  # 装不下 -> 当前块封口，另起新块
+                        write_block(buf)
+                        buf = []
+                    buf.extend(doc)
                 n_docs += len(texts)
                 print(f'[PretrainDataset] 已处理 {n_docs} 文档 -> {n_blocks} blocks', flush=True)
+            if buf:  # 末尾不满一块的文档：pad 补齐后也写入，不丢数据
+                write_block(buf)
     finally:
         writer.close()
         sink.close()
     print(f'[PretrainDataset] 完成: {n_docs} 文档, {n_blocks} packed blocks x {max_length} tokens', flush=True)
     if packed_cache:
         return HFDataset.from_file(packed_cache)
-    from datasets.table import in_memory_table
-    reader = pa.ipc.open_stream(pa.BufferReader(sink.getvalue()))
-    return HFDataset(in_memory_table(reader.read_all()))
+    return HFDataset(pa.ipc.open_stream(pa.BufferReader(sink.getvalue())).read_all())
 
 
 class PretrainStreamDataset(IterableDataset):
     """流式英文预训练数据集（参考 axolotl streaming 方式）：按 shard 顺序读 parquet 的
-    text 列 -> 线程池即时分词（fast tokenizer 释放 GIL）-> 在线拼接成 max_length 定长块。
+    text 列 -> 线程池即时分词（fast tokenizer 释放 GIL）-> 在线按最大长度紧凑 packing 成
+    max_length 定长块（整块文档装袋，装不下就封口 pad、另起新块，文档不跨块）。
     不做全量预处理，内存占用仅为预取 buffer，适合 10B+ tokens 级语料全程单遍训练。
 
     - skip_samples: 跳过前 N 篇文档（原始读取，不分词），用于消费"下一批"数据
@@ -179,6 +192,7 @@ class PretrainStreamDataset(IterableDataset):
         import pyarrow.parquet as pq
         from concurrent.futures import ThreadPoolExecutor
         bos_id, eos_id = self.tokenizer.bos_token_id, self.tokenizer.eos_token_id
+        pad_id = self.tokenizer.pad_token_id
         tok = self.tokenizer
         max_length = self.max_length
 
@@ -203,19 +217,27 @@ class PretrainStreamDataset(IterableDataset):
                 yield chunk
                 chunk = list(islice(it, size))
 
+        def emit(block):
+            block = block + [pad_id] * (max_length - len(block))  # 紧凑块封口：块尾 pad 补齐
+            return torch.tensor(block, dtype=torch.long)
+
         buf, n_blocks = [], 0
         with ThreadPoolExecutor(max_workers=self.num_threads) as pool:
             for texts in chunk_iter(read_texts(), 20000):
                 for ids in pool.map(lambda t: tok(t, add_special_tokens=False)['input_ids'], texts):
-                    buf.append(bos_id)
-                    buf.extend(ids)
-                    buf.append(eos_id)
-                    while len(buf) >= max_length:
-                        block, buf = buf[:max_length], buf[max_length:]
+                    if len(ids) > max_length - 2:  # 单篇超长：截断正文，保留 bos/eos
+                        ids = ids[:max_length - 2]
+                    doc = [bos_id, *ids, eos_id]
+                    if buf and len(buf) + len(doc) > max_length:  # 装不下 -> 封口另起新块
                         n_blocks += 1
                         if n_blocks > self.skip_blocks:
-                            yield torch.tensor(block, dtype=torch.long)
-        # 末尾不足一块的 token 丢弃
+                            yield emit(buf)
+                        buf = []
+                    buf.extend(doc)
+        if buf:  # 末尾不满一块的文档：pad 补齐后也产出，不丢数据
+            n_blocks += 1
+            if n_blocks > self.skip_blocks:
+                yield emit(buf)
 
 
 def estimate_stream_iters(files, batch_size, max_length, max_samples=0, tok_per_doc=1070):
@@ -230,13 +252,14 @@ def estimate_stream_iters(files, batch_size, max_length, max_samples=0, tok_per_
 def _load_jsonl_packed(files, ext, text_column, max_samples, min_doc_chars, max_length,
                        tokenizer, num_proc):
     """jsonl 小语料的加载路径（load_dataset + 并行 map + packing）"""
-    ds = load_dataset(ext, data_files=files, split='train')
+    ds = load_dataset('json', data_files=files, split='train')
     if max_samples and max_samples > 0 and max_samples < len(ds):
         ds = ds.select(range(max_samples))
     ds = ds.filter(lambda x: x[text_column] and len(x[text_column]) >= min_doc_chars,
                    num_proc=num_proc, desc='过滤短文档')
 
     bos_id, eos_id = tokenizer.bos_token_id, tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id
     def encode(batch):
         enc = tokenizer(batch[text_column], add_special_tokens=False)['input_ids']
         return {'input_ids': [[bos_id] + ids + [eos_id] for ids in enc]}
@@ -244,17 +267,26 @@ def _load_jsonl_packed(files, ext, text_column, max_samples, min_doc_chars, max_
                 remove_columns=ds.column_names, desc='分词')
     ds = ds.cast_column('input_ids', Sequence(Value('int32')))
 
-    # packing：num_proc=1 时各批次按序处理，闭包 buffer 可跨批次保留，最后不足一块的尾token丢弃
+    # 按最大长度紧凑 packing：num_proc=1 时各批次按序处理，闭包 buffer 可跨批次保留；
+    # 整块文档装袋，装不下就 pad 封口另起新块，文档不跨块；超长文档截断保留 bos/eos
     def pack(batch):
-        pack.buf.extend(chain.from_iterable(batch['input_ids']))
         blocks = []
-        while len(pack.buf) >= max_length:
-            blocks.append(pack.buf[:max_length])
-            pack.buf = pack.buf[max_length:]
+        for doc in batch['input_ids']:
+            if len(doc) > max_length:
+                doc = doc[:max_length - 1] + [doc[-1]]  # 截断正文，保留 bos/eos
+            if pack.buf and len(pack.buf) + len(doc) > max_length:
+                pack.buf.extend([pad_id] * (max_length - len(pack.buf)))
+                blocks.append(pack.buf)
+                pack.buf = []
+            pack.buf.extend(doc)
         return {'input_ids': blocks} if blocks else {'input_ids': []}
     pack.buf = []
     ds = ds.map(pack, batched=True, batch_size=2000, num_proc=1,
-                remove_columns=ds.column_names, desc='拼接packing')
+                remove_columns=ds.column_names, desc='紧凑packing')
+    if pack.buf:  # 末尾不满一块的文档：pad 补齐后也写入，不丢数据
+        from datasets import concatenate_datasets, Dataset
+        tail = Dataset.from_dict({'input_ids': [pack.buf + [pad_id] * (max_length - len(pack.buf))]})
+        ds = concatenate_datasets([ds, tail])
     return ds
 
 

@@ -17,6 +17,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
 from model.model_minimind import MiniMindConfig, packing_varlen_info, _flash_attn_varlen
+from model import model_minimind as model_module
 from dataset.lm_dataset import PretrainDataset, PretrainStreamDataset, estimate_stream_iters
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
@@ -56,8 +57,9 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             param_group['lr'] = lr
 
         with autocast_ctx:
-            if args.use_varlen:  # packing变长attention：文档间隔离，文档内位置重置
-                cu_seqlens, max_seqlen, position_ids = packing_varlen_info(input_ids, args.bos_token_id)
+            if args.use_varlen:  # packing变长attention：文档间/块尾pad段隔离，文档内位置重置
+                cu_seqlens, max_seqlen, position_ids = packing_varlen_info(input_ids, args.bos_token_id,
+                                                                           args.pad_token_id)
                 res = model(input_ids, labels=labels, position_ids=position_ids,
                             cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
             else:
@@ -134,7 +136,10 @@ if __name__ == "__main__":
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--max_seq_len', default=1024, type=int, help="packing 定长块长度（英文语料建议512~2048）")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
-    parser.add_argument('--gradient_checkpointing', default=0, type=int, choices=[0, 1], help="梯度检查点：以~30%重算开销换显存，大模型必开")
+    parser.add_argument('--gradient_checkpointing', default=0, type=int, choices=[0, 1, 2], help="梯度检查点：0=关，1=每层全重算，2=只重算MLP（省显存且重算量减半，推荐大模型用2）")
+    parser.add_argument('--use_fused_ce', default=1, type=int, choices=[0, 1], help="融合 lm_head+交叉熵：logits 不物化，省显存+省带宽（1=开，0=关闭用回原实现）")
+    parser.add_argument('--fused_ce_chunk', default=1024, type=int, help="融合CE的token分块大小，越小越省显存、越大越快")
+    parser.add_argument('--compile_dynamic', default=1, type=int, choices=[0, 1], help="torch.compile(dynamic=True)：packing变长导致cu_seqlens长度每步变化，动态shape可避免反复重编译")
     parser.add_argument('--seed', default=42, type=int, help="随机种子（DDP下每个rank为seed+rank，每轮为seed+epoch）")
     parser.add_argument("--data_path", type=str, default="/root/gpufree-data/dataset/Nemotron-CC-Math-v1/4plus", help="预训练数据路径（parquet 目录/glob，或 jsonl 文件）")
     parser.add_argument("--text_column", type=str, default="text", help="文本列名")
@@ -169,12 +174,18 @@ if __name__ == "__main__":
     args.pad_token_id = tokenizer.pad_token_id
     args.bos_token_id = tokenizer.bos_token_id
     args.use_varlen = _flash_attn_varlen is not None  # packing变长attention，需flash-attn
+    gc_mode = {0: False, 1: True, 2: 'mlp'}[args.gradient_checkpointing]
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
                                use_moe=bool(args.use_moe), vocab_size=len(tokenizer),
                                bos_token_id=tokenizer.bos_token_id, eos_token_id=tokenizer.eos_token_id,
-                               gradient_checkpointing=bool(args.gradient_checkpointing))
+                               gradient_checkpointing=gc_mode,
+                               use_fused_ce=bool(args.use_fused_ce),
+                               fused_ce_chunk=args.fused_ce_chunk)
     if args.use_varlen:
         Logger('启用 packing 变长attention（flash_attn_varlen，文档间隔离）')
+    Logger(f'吞吐优化: fused_ce={bool(args.use_fused_ce)} chunk={args.fused_ce_chunk} | '
+           f'fused_rmsnorm={getattr(model_module, "_fused_rms_norm", None) is not None} | '
+           f'gradient_checkpointing={gc_mode} | compile={bool(args.use_compile)}/dynamic={bool(args.compile_dynamic)}')
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints', resume_dir=args.resume_dir) if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
@@ -235,7 +246,7 @@ if __name__ == "__main__":
         if not args.packed_cache and os.path.isdir(args.data_path):
             src = os.path.basename(os.path.normpath(args.data_path))
             n = args.max_samples or 'all'
-            args.packed_cache = f'../dataset_cache/packed_{src}_{n}_s{args.max_seq_len}.arrow'
+            args.packed_cache = f'../dataset_cache/packed_{src}_{n}_s{args.max_seq_len}_compact.arrow'
         train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len,
                                    text_column=args.text_column, max_samples=args.max_samples,
                                    num_proc=args.num_proc, packed_cache=args.packed_cache or None)
@@ -257,8 +268,10 @@ if __name__ == "__main__":
     
     # ========== 7. 编译和分布式包装 ==========
     if args.use_compile == 1:
-        model = torch.compile(model)
-        Logger('torch.compile enabled')
+        # dynamic=True：packing 每步的文档数(cu_seqlens长度)都在变，静态 shape 会触发
+        # 每步重编译，撞到 dynamo 的 cache_size_limit(默认8) 后编译直接失效退回 eager。
+        model = torch.compile(model, dynamic=bool(args.compile_dynamic))
+        Logger(f'torch.compile enabled (dynamic={bool(args.compile_dynamic)})')
     if dist.is_initialized():
         model = DistributedDataParallel(model, device_ids=[local_rank])
     

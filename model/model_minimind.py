@@ -10,6 +10,11 @@ try:  # packing 变长attention：flash_attn_varlen_func，文档间注意力隔
 except ImportError:
     _flash_attn_varlen = None
 
+try:  # 融合 RMSNorm（torch>=2.4 的 aten 融合 kernel）；缺失时自动退回原生实现
+    from torch.nn.functional import rms_norm as _fused_rms_norm
+except ImportError:
+    _fused_rms_norm = None
+
 if _flash_attn_varlen is not None:
     # 包装为custom op使torch.compile可 tracing（变长cu_seqlens走动态shape，fake impl直通）。
     # 训练需要autograd公式：backward直接复用flash_attn自带的可微实现（dropout仅支持0.0）
@@ -45,14 +50,20 @@ if _flash_attn_varlen is not None:
     _varlen_attention_op.register_autograd(_varlen_attention_backward, setup_context=_varlen_attention_setup)
 
 
-def packing_varlen_info(input_ids, bos_token_id):
-    """由packing块内的bos位置推导文档边界，返回 (cu_seqlens, max_seqlen, position_ids)。
+def packing_varlen_info(input_ids, bos_token_id, pad_token_id=None):
+    """由packing块内的bos/pad位置推导文档边界，返回 (cu_seqlens, max_seqlen, position_ids)。
 
     cu_seqlens: int32 (nseg+1,)，展平batch后的文档起始偏移；position_ids: (B, L) 文档内位置（每篇重置为0）。
+    按最大长度紧凑packing时块尾有pad段：传入pad_token_id后，pad与非pad交界处也切为独立段，
+    pad段只与自身做attention，不并入（污染）最后一篇文档。
     """
     bsz, seq_len = input_ids.shape
     device = input_ids.device
     is_start = input_ids.eq(bos_token_id)
+    if pad_token_id is not None:
+        is_pad = input_ids.eq(pad_token_id)
+        prev_pad = torch.cat([is_pad[:, :1], is_pad[:, :-1]], dim=1)  # token i-1 是否为pad
+        is_start = is_start | (is_pad ^ prev_pad)  # pad段首尾都是段边界
     idx = torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
     seg_start = torch.cummax(is_start * (idx + 1), dim=1).values
     position_ids = idx - (seg_start - 1)
@@ -60,7 +71,9 @@ def packing_varlen_info(input_ids, bos_token_id):
     starts = starts[starts > 0]  # 展平后第0个token必为块首bos，其偏移0由下面显式补上
     total = torch.tensor(bsz * seq_len, dtype=torch.int32, device=device)
     cu_seqlens = torch.cat([starts.new_zeros(1), starts, total.unsqueeze(0)])
-    max_seqlen = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item())
+    # max_seqlen 只是 flash-attn 的上界（用于网格/tile 规划），取块长即可：
+    # 省掉一次 .max().item() 的 GPU 同步，避免每个 micro-batch 阻塞流水线。
+    max_seqlen = seq_len
     return cu_seqlens, max_seqlen, position_ids
 
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
@@ -102,11 +115,99 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
-        self.gradient_checkpointing = kwargs.get("gradient_checkpointing", False)
+        # gradient_checkpointing: False / True(='full'，逐层重算) / 'mlp'（只重算 MLP，省显存同时
+        # 少一半重算量，因为 MLP 的激活显存是 attention 的 ~3 倍而 FLOPs 只有 ~2 倍）
+        gc = kwargs.get("gradient_checkpointing", False)
+        if gc is True:
+            gc = 'full'
+        self.gradient_checkpointing = gc
+        # 融合 lm_head+CE（logits 不物化）：省显存 + 省 fp32 升采样的带宽
+        self.use_fused_ce = kwargs.get("use_fused_ce", True)
+        self.fused_ce_chunk = kwargs.get("fused_ce_chunk", 1024)
 
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 #                                     MiniMind Model
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
+#                                     Fused ops
+#              （带宽受限的小 kernel 融合：RMSNorm / RoPE / lm_head+CE）
+# 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
+def fused_linear_cross_entropy(hidden, weight, labels, ignore_index=-100, chunk=1024):
+    """lm_head + shift + CE 融合：logits 不物化。
+
+    等价于 F.cross_entropy((hidden @ weight.T)[..., :-1, :], labels[..., 1:], ignore_index)，
+    但按 token 分块做 GEMM+CE，前向/反向都只保留 chunk 大小的 logits（float32），
+    省掉 [B*L, vocab] 的 bf16 logits 物化 + log_softmax 的 fp32 升采样两趟写回。
+    反向按 chunk 重算 logits（Liger fused linear CE 的同一思路，纯 torch 实现无额外依赖）。
+    """
+    return _FusedLinearCrossEntropy.apply(hidden, weight, labels, ignore_index, chunk)
+
+
+class _FusedLinearCrossEntropy(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hidden, weight, labels, ignore_index, chunk):
+        hidden_dim = hidden.shape[-1]
+        seq_len = labels.shape[-1]
+        # 混合精度训练里 lm_head.weight 保持 fp32 主权重、hidden 是 autocast 出的 bf16，
+        # 而 autocast 只会把"两个输入都是 fp32"的 matmul 降到低精度，混合 dtype 会直接报错，
+        # 所以这里显式对齐（与 autocast 对纯 fp32 matmul 的处理一致）。
+        flat_weight = weight if weight.dtype == hidden.dtype else weight.to(hidden.dtype)
+        flat_hidden = hidden.reshape(-1, hidden_dim)
+        n_tokens = flat_hidden.shape[0] - 1
+        # 下一个 token 预测：token i 的 logits 对 labels[i+1]；每行最后一个 token 与下一行首 token
+        # 属于不同文档，从 loss 中剔除（与 logits[..., :-1] / labels[..., 1:] 的配对一致）
+        flat_labels = labels.reshape(-1)[1:1 + n_tokens].clone()
+        flat_labels[seq_len - 1::seq_len] = ignore_index
+        flat_hidden = flat_hidden[:n_tokens]
+
+        total = torch.zeros((), device=hidden.device, dtype=torch.float32)
+        n_valid = torch.zeros((), device=hidden.device, dtype=torch.float32)
+        for start in range(0, n_tokens, chunk):
+            h = flat_hidden[start:start + chunk]
+            t = flat_labels[start:start + chunk]
+            logits = torch.mm(h, flat_weight.t()).float()
+            keep = t != ignore_index
+            lse = torch.logsumexp(logits, dim=-1)
+            tgt = logits.gather(1, t.clamp(min=0).unsqueeze(1)).squeeze(1)
+            total = total + torch.where(keep, lse - tgt, torch.zeros_like(lse)).sum()
+            n_valid = n_valid + keep.sum()
+            del logits
+        n_valid = n_valid.clamp(min=1)
+        ctx.save_for_backward(flat_hidden, flat_weight, flat_labels, n_valid)
+        ctx.hidden_shape = hidden.shape
+        ctx.hidden_dim = hidden_dim
+        ctx.n_flat = hidden.numel() // hidden_dim
+        ctx.weight_dtype = weight.dtype
+        ctx.ignore_index = ignore_index
+        ctx.chunk = chunk
+        return total / n_valid
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        hidden, weight, labels, n_valid = ctx.saved_tensors
+        n_tokens = hidden.shape[0]
+        # 展平后的最后一行（整个 batch 的最后一个 token）不参与 loss，梯度保持 0，
+        # 但返回的梯度形状必须与输入 hidden 完全一致（[B, L, H] 或 [N, H] 都支持）
+        flat_grad_hidden = torch.zeros((ctx.n_flat, ctx.hidden_dim),
+                                       device=hidden.device, dtype=hidden.dtype)
+        grad_weight = torch.zeros_like(weight, dtype=torch.float32)
+        scale = grad_output.to(torch.float32) / n_valid
+        for start in range(0, n_tokens, ctx.chunk):
+            end = min(start + ctx.chunk, n_tokens)
+            h = hidden[start:end]
+            t = labels[start:end]
+            logits = torch.mm(h, weight.t()).float()
+            probs = torch.exp(logits - torch.logsumexp(logits, dim=-1, keepdim=True))
+            keep = (t != ctx.ignore_index).unsqueeze(1)
+            probs = torch.where(keep, probs, torch.zeros_like(probs))
+            probs.scatter_add_(1, t.clamp(min=0).unsqueeze(1), -keep.to(probs.dtype))
+            probs.mul_(scale)
+            probs = probs.to(h.dtype)
+            flat_grad_hidden[start:end] = torch.mm(probs, weight)
+            grad_weight += torch.mm(probs.t(), h).to(torch.float32)
+            del logits, probs
+        return flat_grad_hidden.view(ctx.hidden_shape), grad_weight.to(ctx.weight_dtype), None, None, None
+
+
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -117,6 +218,12 @@ class RMSNorm(torch.nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        # 融合实现：单个 CUDA kernel 内完成 fp32 归约 + 缩放，避免 x.float() 把整个激活
+        # 升采样到 fp32 再拷回来（原来一趟 RMSNorm 要读写 ~2GB 显存）
+        if _fused_rms_norm is not None and x.is_cuda and x.dtype in (torch.bfloat16, torch.float16):
+            # autocast 下 self.weight 仍是 fp32 主权重，融合 kernel 要求 input/weight 同 dtype
+            w = self.weight if self.weight.dtype == x.dtype else self.weight.to(x.dtype)
+            return _fused_rms_norm(x, (self.weight.shape[0],), w, self.eps)
         return (self.weight * self.norm(x.float())).type_as(x)
 
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6, rope_scaling: dict = None):
@@ -255,14 +362,18 @@ class MiniMindBlock(nn.Module):
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None,
-                cu_seqlens=None, max_seqlen=None):
+                cu_seqlens=None, max_seqlen=None, checkpoint_mlp=False):
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states), position_embeddings,
             past_key_value, use_cache, attention_mask, cu_seqlens, max_seqlen
         )
         hidden_states += residual
-        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        if checkpoint_mlp:
+            hidden_states = hidden_states + checkpoint(self.mlp, self.post_attention_layernorm(hidden_states),
+                                                       use_reentrant=False)
+        else:
+            hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value
 
 class MiniMindModel(nn.Module):
@@ -295,9 +406,12 @@ class MiniMindModel(nn.Module):
         cu_seqlens = kwargs.get('cu_seqlens', None)
         max_seqlen = kwargs.get('max_seqlen', None)
         presents = []
-        gc_enabled = self.config.gradient_checkpointing and self.training and not use_cache
+        gc_mode = self.config.gradient_checkpointing
+        gc_enabled = bool(gc_mode) and self.training and not use_cache
+        gc_full = gc_enabled and gc_mode != 'mlp'
+        gc_mlp = gc_enabled and gc_mode == 'mlp'
         for layer, past_key_value in zip(self.layers, past_key_values):
-            if gc_enabled:
+            if gc_full:
                 # 以 ~30% 重算开销换取激活内存大幅下降；注意 MoE 的 aux_loss 不参与梯度
                 hidden_states, present = checkpoint(
                     layer, hidden_states, position_embeddings,
@@ -314,6 +428,7 @@ class MiniMindModel(nn.Module):
                     attention_mask=attention_mask,
                     cu_seqlens=cu_seqlens,
                     max_seqlen=max_seqlen,
+                    checkpoint_mlp=gc_mlp,
                 )
             presents.append(present)
         hidden_states = self.norm(hidden_states)
@@ -333,6 +448,13 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
 
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
         hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask, past_key_values, use_cache, **kwargs)
+        if labels is not None and self.config.use_fused_ce and hidden_states.is_cuda \
+                and hidden_states.dtype in (torch.bfloat16, torch.float16):
+            # lm_head + CE 融合：不物化 [B*L, vocab] logits（32k 词表下省 ~6G 显存 + 多趟带宽）
+            loss = fused_linear_cross_entropy(hidden_states, self.lm_head.weight, labels,
+                                              ignore_index=-100, chunk=self.config.fused_ce_chunk)
+            return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=None,
+                                             past_key_values=past_key_values, hidden_states=hidden_states)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         loss = None
